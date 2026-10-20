@@ -1,0 +1,9 @@
+The files in this directory are the reference implementation of
+CRYSTALS-Dilithium / ML-DSA (FIPS 204) from the pq-crystals project,
+https://github.com/pq-crystals/dilithium (directory ref/), without changes.
+
+They are released into the public domain under CC0 1.0
+(https://creativecommons.org/publicdomain/zero/1.0/) or, at your choice,
+under the Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
+fips202.c is based on public-domain Keccak code; see the comments at the top
+of that file.

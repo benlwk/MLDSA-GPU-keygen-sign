@@ -1,0 +1,745 @@
+/*
+ * Copyright 2022-2023 [Anonymous].
+ *
+ * This file is part of cuDilithium.
+ *
+ * cuDilithium is free software: you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License as published by the Free Software
+ * Foundation, either version 3 of the License, or (at your option) any later
+ * version.
+ *
+ * cuDilithium is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+ * details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * cuDilithium. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Modified in 2026: ported to FIPS 204 (ML-DSA); fused and staged signing,
+ * warp NTT and key caching.
+ */
+
+#include "api.cuh"
+
+#include "fips202/fips202.cuh"
+#include "keypair.cuh"
+#include "params.h"
+#include "sign.cuh"
+#include "util.cuh"
+#include "verify.cuh"
+
+#ifdef USE_CACHED_SK
+#include <mutex>
+#include <unordered_map>
+// Maps d_sign_mem_pool -> last sk host-pointer used for that pool.
+// When the same (pool, sk_ptr) is detected, the expensive SK setup
+// (SK memcpy, mat expand, unpack+NTT) is skipped entirely.
+static std::mutex g_sk_cache_mutex;
+static std::unordered_map<void *, const uint8_t *> g_sk_cache;
+
+void crypto_sign_invalidate_cache(void *d_sign_mem_pool) {
+  std::lock_guard<std::mutex> lk(g_sk_cache_mutex);
+  g_sk_cache.erase(d_sign_mem_pool);
+}
+#endif
+
+#ifdef USE_CACHED_SK_SINGLE
+#include <cstring>
+#include <mutex>
+
+struct SingleSkCacheEntry {
+  const uint8_t *host_sk_ptr = nullptr;
+  uint8_t tr[TRBYTES] = {0};
+
+  // GPU buffers (single copies, NOT scaled by batch_size)
+  int32_t *d_mat = nullptr;
+  int32_t *d_s1 = nullptr;
+  int32_t *d_s2 = nullptr;
+  int32_t *d_t0 = nullptr;
+
+  uint8_t *d_sk = nullptr;
+  uint8_t *d_rho = nullptr;
+  uint8_t *d_tr = nullptr;
+  uint8_t *d_key = nullptr;
+  cudaEvent_t setup_event = nullptr;
+};
+
+static std::mutex g_sk_single_mutex;
+static SingleSkCacheEntry g_sk_single_cache;
+
+extern "C" void crypto_sign_invalidate_single_cache() {
+  std::lock_guard<std::mutex> lk(g_sk_single_mutex);
+  // force a new setup on the next call, but keep the device buffers
+  g_sk_single_cache.host_sk_ptr = nullptr;
+  memset(g_sk_single_cache.tr, 0, sizeof(g_sk_single_cache.tr));
+}
+
+extern "C" void crypto_sign_destroy_single_cache() {
+  std::lock_guard<std::mutex> lk(g_sk_single_mutex);
+  if (g_sk_single_cache.d_mat)
+    cudaFree(g_sk_single_cache.d_mat);
+  if (g_sk_single_cache.d_s1)
+    cudaFree(g_sk_single_cache.d_s1);
+  if (g_sk_single_cache.d_s2)
+    cudaFree(g_sk_single_cache.d_s2);
+  if (g_sk_single_cache.d_t0)
+    cudaFree(g_sk_single_cache.d_t0);
+  if (g_sk_single_cache.d_sk)
+    cudaFree(g_sk_single_cache.d_sk);
+  if (g_sk_single_cache.d_rho)
+    cudaFree(g_sk_single_cache.d_rho);
+  if (g_sk_single_cache.d_tr)
+    cudaFree(g_sk_single_cache.d_tr);
+  if (g_sk_single_cache.d_key)
+    cudaFree(g_sk_single_cache.d_key);
+  if (g_sk_single_cache.setup_event)
+    cudaEventDestroy(g_sk_single_cache.setup_event);
+  g_sk_single_cache = SingleSkCacheEntry();
+}
+
+__global__ void broadcast_seeds_kernel(uint8_t *d_tr, uint8_t *d_key,
+                                       const uint8_t *g_tr,
+                                       const uint8_t *g_key, size_t pitch,
+                                       size_t batch_size) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < batch_size) {
+    uint8_t *tr_dst = d_tr + idx * pitch;
+    uint8_t *key_dst = d_key + idx * pitch;
+    for (int i = 0; i < TRBYTES; ++i)
+      tr_dst[i] = g_tr[i];
+    for (int i = 0; i < SEEDBYTES; ++i)
+      key_dst[i] = g_key[i];
+  }
+}
+#endif
+
+int crypto_sign_keypair(uint8_t *pk, uint8_t *sk, uint8_t *d_keypair_mem_pool,
+                        size_t keypair_mem_pool_pitch, size_t batch_size,
+                        cudaStream_t stream, size_t rand_index) {
+  size_t byte_size = ALIGN_TO_256_BYTES(CRYPTO_PUBLICKEYBYTES) + // pk
+                     ALIGN_TO_256_BYTES(CRYPTO_SECRETKEYBYTES);  // sk
+
+  // pk
+  uint8_t *d_pk = d_keypair_mem_pool;
+  uint8_t *d_pk_rho = d_pk + 0;
+  uint8_t *d_pk_t1 = d_pk_rho + SEEDBYTES;
+
+  // sk
+  uint8_t *d_sk =
+      d_keypair_mem_pool + ALIGN_TO_256_BYTES(CRYPTO_PUBLICKEYBYTES);
+  uint8_t *d_sk_rho = d_sk + 0;
+  uint8_t *d_sk_key = d_sk_rho + SEEDBYTES;
+  uint8_t *d_sk_tr = d_sk_key + SEEDBYTES;
+  uint8_t *d_sk_s1_packed = d_sk_tr + TRBYTES;
+  uint8_t *d_sk_s2_packed = d_sk_s1_packed + DILITHIUM_L * POLYETA_PACKEDBYTES;
+  uint8_t *d_sk_t0_packed = d_sk_s2_packed + DILITHIUM_K * POLYETA_PACKEDBYTES;
+
+  // As
+  auto *d_t1 = (int32_t *)(d_keypair_mem_pool + byte_size);
+  cudaMemset2DAsync(d_t1, keypair_mem_pool_pitch, 0,
+                    DILITHIUM_K * DILITHIUM_N * sizeof(int32_t), batch_size,
+                    stream);
+
+#if defined(USE_128T_KEYPAIR)
+  gpu_keypair_128t<<<batch_size, 128, 0, stream>>>(
+#else
+  gpu_keypair<<<batch_size, 32, 0, stream>>>(
+#endif
+      d_pk_rho, d_pk_t1, d_sk_rho, d_sk_key, d_sk_tr, d_sk_s1_packed,
+      d_sk_s2_packed, d_sk_t0_packed, d_t1, keypair_mem_pool_pitch, rand_index);
+
+  cudaMemcpy2DAsync(pk, CRYPTO_PUBLICKEYBYTES, d_pk, keypair_mem_pool_pitch,
+                    CRYPTO_PUBLICKEYBYTES, batch_size, cudaMemcpyDeviceToHost,
+                    stream);
+  cudaMemcpy2DAsync(sk, CRYPTO_SECRETKEYBYTES, d_sk, keypair_mem_pool_pitch,
+                    CRYPTO_SECRETKEYBYTES, batch_size, cudaMemcpyDeviceToHost,
+                    stream);
+
+  return 0;
+}
+
+int crypto_sign_signature(uint8_t *sig, size_t sig_pitch, size_t *siglen,
+                          const uint8_t *m, size_t m_pitch, size_t mlen,
+                          const uint8_t *sk, uint8_t *d_sign_mem_pool,
+                          size_t d_sign_mem_pool_pitch,
+                          uint8_t *d_temp_mem_pool,
+                          size_t d_temp_mem_pool_pitch, task_lut &lut,
+                          size_t exec_threshold, size_t batch_size,
+                          cudaStream_t stream) {
+
+  uint8_t *d_sig = d_sign_mem_pool + 0;
+  uint8_t *d_seed = d_sig; // c_tilde
+  uint8_t *d_z_packed = d_seed + CTILDEBYTES;
+  uint8_t *d_hint = d_z_packed + DILITHIUM_L * POLYZ_PACKEDBYTES;
+
+  uint8_t *d_sk = d_sig + ALIGN_TO_256_BYTES(CRYPTO_BYTES);
+  uint8_t *d_sk_rho = d_sk;
+  uint8_t *d_sk_key = d_sk_rho + SEEDBYTES;
+  uint8_t *d_sk_tr = d_sk_key + SEEDBYTES;
+  uint8_t *d_sk_s1_packed = d_sk_tr + TRBYTES;
+  uint8_t *d_sk_s2_packed = d_sk_s1_packed + DILITHIUM_L * POLYETA_PACKEDBYTES;
+  uint8_t *d_sk_t0_packed = d_sk_s2_packed + DILITHIUM_K * POLYETA_PACKEDBYTES;
+
+  uint8_t *d_rho = d_sk + ALIGN_TO_256_BYTES(CRYPTO_SECRETKEYBYTES);
+
+  // tr || M', M' = 0 || 0 || m (pure ML-DSA, empty context)
+  uint8_t *d_tr = d_rho + ALIGN_TO_256_BYTES(SEEDBYTES);
+  uint8_t *d_msg_prefix = d_tr + TRBYTES;
+  uint8_t *d_m = d_msg_prefix + MSG_PREFIX_BYTES;
+
+  // key || rnd || mu || w1(packed)
+  uint8_t *d_key =
+      d_tr + ALIGN_TO_256_BYTES(TRBYTES + MSG_PREFIX_BYTES + mlen);
+  uint8_t *d_rnd = d_key + SEEDBYTES;
+  uint8_t *d_mu = d_rnd + RNDBYTES;
+  uint8_t *d_w1_packed = d_mu + CRHBYTES;
+
+  uint8_t *d_rhoprime =
+      d_key + ALIGN_TO_256_BYTES(SEEDBYTES + RNDBYTES + CRHBYTES +
+                                 DILITHIUM_K * POLYW1_PACKEDBYTES);
+
+  size_t byte_size = SIGN_POOL_BYTE_SIZE(mlen);
+
+  auto *pool_start = (int32_t *)(d_sign_mem_pool + byte_size);
+
+  int32_t *d_mat = nullptr;
+  int32_t *d_s1 = nullptr;
+  int32_t *d_s2 = nullptr;
+  int32_t *d_t0 = nullptr;
+
+#ifndef USE_CACHED_SK_SINGLE
+  d_mat = pool_start;
+  d_s1 = d_mat + DILITHIUM_K * DILITHIUM_L * DILITHIUM_N;
+#endif
+
+  int32_t *d_y = pool_start + DILITHIUM_K * DILITHIUM_L * DILITHIUM_N +
+                 DILITHIUM_L * DILITHIUM_N;
+  int32_t *d_z = d_y + DILITHIUM_L * DILITHIUM_N;
+
+#ifndef USE_CACHED_SK_SINGLE
+  d_t0 = d_z + DILITHIUM_L * DILITHIUM_N;
+  d_s2 = d_t0 + DILITHIUM_K * DILITHIUM_N;
+#endif
+
+  int32_t *d_w1 = pool_start + DILITHIUM_K * DILITHIUM_L * DILITHIUM_N +
+                  DILITHIUM_L * DILITHIUM_N * 3 + // d_s1 + d_y + d_z
+                  DILITHIUM_K * DILITHIUM_N * 2;  // d_t0 + d_s2
+  int32_t *d_w0 = d_w1 + DILITHIUM_K * DILITHIUM_N;
+  int32_t *d_cp = d_w0 + DILITHIUM_K * DILITHIUM_N;
+
+  //    CUDATimer timer_sign("sign");
+  //    timer_sign.start();
+
+  cudaMemcpy2DAsync(d_m, d_sign_mem_pool_pitch, m, m_pitch, mlen, batch_size,
+                    cudaMemcpyHostToDevice, stream);
+
+#ifdef USE_CACHED_SK_SINGLE
+  bool sk_setup_needed = false;
+  {
+    std::lock_guard<std::mutex> lk(g_sk_single_mutex);
+    if (!g_sk_single_cache.d_mat) {
+      cudaMalloc(&g_sk_single_cache.d_mat,
+                 DILITHIUM_K * DILITHIUM_L * DILITHIUM_N * sizeof(int32_t));
+      cudaMalloc(&g_sk_single_cache.d_s1,
+                 DILITHIUM_L * DILITHIUM_N * sizeof(int32_t));
+      cudaMalloc(&g_sk_single_cache.d_s2,
+                 DILITHIUM_K * DILITHIUM_N * sizeof(int32_t));
+      cudaMalloc(&g_sk_single_cache.d_t0,
+                 DILITHIUM_K * DILITHIUM_N * sizeof(int32_t));
+      cudaMalloc(&g_sk_single_cache.d_sk, CRYPTO_SECRETKEYBYTES);
+      cudaMalloc(&g_sk_single_cache.d_rho, SEEDBYTES);
+      cudaMalloc(&g_sk_single_cache.d_tr, TRBYTES);
+      cudaMalloc(&g_sk_single_cache.d_key, SEEDBYTES);
+      cudaEventCreate(&g_sk_single_cache.setup_event);
+      sk_setup_needed = true;
+    }
+    if (!sk_setup_needed) {
+      if (g_sk_single_cache.host_sk_ptr != sk) {
+        if (memcmp(g_sk_single_cache.tr, sk + 2 * SEEDBYTES, TRBYTES) != 0) {
+          sk_setup_needed = true;
+        } else {
+          g_sk_single_cache.host_sk_ptr = sk;
+        }
+      }
+    }
+    if (sk_setup_needed) {
+      g_sk_single_cache.host_sk_ptr = sk;
+      memcpy(g_sk_single_cache.tr, sk + 2 * SEEDBYTES, TRBYTES);
+
+      // Do GPU setup and event record INSIDE the mutex so that by the time
+      // any other thread can observe the updated cache state, the event
+      // is already recorded. This prevents the race where other threads
+      // call cudaStreamWaitEvent on an unrecorded event (which is a no-op).
+      cudaMemcpyAsync(g_sk_single_cache.d_sk, sk, CRYPTO_SECRETKEYBYTES,
+                      cudaMemcpyHostToDevice, stream);
+
+      uint8_t *d_sk_rho_c = g_sk_single_cache.d_sk + 0;
+      uint8_t *d_sk_key_c = d_sk_rho_c + SEEDBYTES;
+      uint8_t *d_sk_tr_c = d_sk_key_c + SEEDBYTES;
+      uint8_t *d_sk_s1_packed_c = d_sk_tr_c + TRBYTES;
+      uint8_t *d_sk_s2_packed_c =
+          d_sk_s1_packed_c + DILITHIUM_L * POLYETA_PACKEDBYTES;
+      uint8_t *d_sk_t0_packed_c =
+          d_sk_s2_packed_c + DILITHIUM_K * POLYETA_PACKEDBYTES;
+
+      cudaMemcpyAsync(g_sk_single_cache.d_rho, d_sk_rho_c, SEEDBYTES,
+                      cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpyAsync(g_sk_single_cache.d_tr, d_sk_tr_c, TRBYTES,
+                      cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpyAsync(g_sk_single_cache.d_key, d_sk_key_c, SEEDBYTES,
+                      cudaMemcpyDeviceToDevice, stream);
+
+      polyvec_matrix_expand_opt_kernel<<<1, dim3(32, 4), 0, stream>>>(
+          g_sk_single_cache.d_mat, g_sk_single_cache.d_rho, 0, 1);
+#if defined(USE_128T_SIGN)
+      unpack_fuse_ntt_shuffle_k6_kernel<<<1, 128, 0, stream>>>(
+          g_sk_single_cache.d_s1, g_sk_single_cache.d_s2,
+          g_sk_single_cache.d_t0, d_sk_s1_packed_c, d_sk_s2_packed_c,
+          d_sk_t0_packed_c, 0);
+#else
+      unpack_fuse_ntt_radix2_opt_kernel<<<1, 128, 0, stream>>>(
+          g_sk_single_cache.d_s1, g_sk_single_cache.d_s2,
+          g_sk_single_cache.d_t0, d_sk_s1_packed_c, d_sk_s2_packed_c,
+          d_sk_t0_packed_c, 0);
+#endif
+      cudaEventRecord(g_sk_single_cache.setup_event, stream);
+    }
+  }
+
+  if (!sk_setup_needed) {
+    cudaStreamWaitEvent(stream, g_sk_single_cache.setup_event, 0);
+  }
+
+  // Broadcast seeds to task specific slots in d_sign_mem_pool
+  broadcast_seeds_kernel<<<(batch_size + 31) / 32, 32, 0, stream>>>(
+      d_tr, d_key, g_sk_single_cache.d_tr, g_sk_single_cache.d_key,
+      d_sign_mem_pool_pitch, batch_size);
+#else
+
+#ifdef USE_CACHED_SK
+  // Check if same SK was already uploaded and expanded into this pool.
+  bool sk_setup_needed;
+  {
+    std::lock_guard<std::mutex> lk(g_sk_cache_mutex);
+    auto it = g_sk_cache.find(d_sign_mem_pool);
+    sk_setup_needed = (it == g_sk_cache.end() || it->second != sk);
+    if (sk_setup_needed)
+      g_sk_cache[d_sign_mem_pool] = sk;
+  }
+  if (sk_setup_needed) {
+#endif
+    // Upload SK and set up expanded matrix + NTT-domain polys.
+    cudaMemcpy2DAsync(d_sk, d_sign_mem_pool_pitch, sk, CRYPTO_SECRETKEYBYTES,
+                      CRYPTO_SECRETKEYBYTES, batch_size, cudaMemcpyHostToDevice,
+                      stream);
+    cudaMemcpy2DAsync(d_rho, d_sign_mem_pool_pitch, d_sk_rho,
+                      d_sign_mem_pool_pitch, SEEDBYTES, batch_size,
+                      cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpy2DAsync(d_tr, d_sign_mem_pool_pitch, d_sk_tr,
+                      d_sign_mem_pool_pitch, TRBYTES, batch_size,
+                      cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpy2DAsync(d_key, d_sign_mem_pool_pitch, d_sk_key,
+                      d_sign_mem_pool_pitch, SEEDBYTES, batch_size,
+                      cudaMemcpyDeviceToDevice, stream);
+    polyvec_matrix_expand_opt_kernel<<<(batch_size + 3) / 4, dim3(32, 4), 0,
+                                       stream>>>(
+        d_mat, d_rho, d_sign_mem_pool_pitch, batch_size);
+#if defined(USE_128T_SIGN)
+    unpack_fuse_ntt_shuffle_k6_kernel<<<batch_size, 128, 0, stream>>>(
+        d_s1, d_s2, d_t0, d_sk_s1_packed, d_sk_s2_packed, d_sk_t0_packed,
+        d_sign_mem_pool_pitch);
+#else
+  unpack_fuse_ntt_radix2_opt_kernel<<<batch_size, 128, 0, stream>>>(
+      d_s1, d_s2, d_t0, d_sk_s1_packed, d_sk_s2_packed, d_sk_t0_packed,
+      d_sign_mem_pool_pitch);
+#endif
+
+#ifdef USE_CACHED_SK
+  } // end sk_setup_needed
+#endif
+
+#endif // USE_CACHED_SK_SINGLE
+
+#ifdef USE_CACHED_SK_SINGLE
+  d_mat = g_sk_single_cache.d_mat;
+  d_s1 = g_sk_single_cache.d_s1;
+  d_s2 = g_sk_single_cache.d_s2;
+  d_t0 = g_sk_single_cache.d_t0;
+#endif
+
+  // mu = H(tr || M'), M' = 0 || 0 || m (pure ML-DSA, empty context)
+  cudaMemset2DAsync(d_msg_prefix, d_sign_mem_pool_pitch, 0, MSG_PREFIX_BYTES,
+                    batch_size, stream);
+  notmp_shake_new_kernel<SHAKE256_RATE, 0x1f>
+      <<<(batch_size + 3) / 4, dim3(32, 4), SHAKE256_RATE, stream>>>(
+          d_mu, d_sign_mem_pool_pitch, CRHBYTES, d_tr, d_sign_mem_pool_pitch,
+          TRBYTES + MSG_PREFIX_BYTES + mlen, batch_size);
+
+  // rnd: fresh randomness (hedged) or all zero (deterministic variant)
+#ifdef DILITHIUM_RANDOMIZED_SIGNING
+  uint8_t *h_rnd;
+  cudaMallocHost(&h_rnd, RNDBYTES * batch_size);
+  randombytes(h_rnd, RNDBYTES * batch_size);
+  cudaMemcpy2DAsync(d_rnd, d_sign_mem_pool_pitch, h_rnd, RNDBYTES, RNDBYTES,
+                    batch_size, cudaMemcpyHostToDevice, stream);
+  cudaStreamSynchronize(stream);
+  cudaFreeHost(h_rnd);
+#else
+  cudaMemset2DAsync(d_rnd, d_sign_mem_pool_pitch, 0, RNDBYTES, batch_size,
+                    stream);
+#endif
+
+  // rhoprime = H(key || rnd || mu)
+  notmp_shake_new_kernel<SHAKE256_RATE, 0x1f>
+      <<<(batch_size + 3) / 4, dim3(32, 4), SHAKE256_RATE, stream>>>(
+          d_rhoprime, d_sign_mem_pool_pitch, CRHBYTES, d_key,
+          d_sign_mem_pool_pitch, SEEDBYTES + RNDBYTES + CRHBYTES, batch_size);
+
+#if defined(USE_PERSISTENT_WARPNTT)
+  sign_persistent_warpntt_launch(
+      d_w0, d_w1, d_w1_packed, d_y, d_rhoprime, d_mat, d_z, d_cp, d_z_packed,
+      d_hint, d_s1, d_s2, d_t0, d_mu, d_seed, d_mu, d_sig,
+      d_sign_mem_pool_pitch, batch_size, stream);
+#elif defined(USE_PERSISTENT)
+  sign_persistent_launch(
+      d_w0, d_w1, d_w1_packed, d_y, d_rhoprime, d_mat, d_z, d_cp, d_z_packed,
+      d_hint, d_s1, d_s2, d_t0, d_mu, d_seed, d_mu, d_sig,
+      d_sign_mem_pool_pitch, batch_size, stream);
+#endif
+
+  {
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      printf("HOST: Kernel launch error: %s\n", cudaGetErrorString(err));
+    } else {
+      // printf("HOST: Kernel launched successfully!\n");
+    }
+  }
+
+#if !defined(USE_PERSISTENT_WARPNTT) && !defined(USE_PERSISTENT)
+  // temp pool
+
+  uint8_t *d_temp_sig = d_temp_mem_pool + 0;
+  uint8_t *d_temp_seed = d_temp_sig;
+  uint8_t *d_temp_z_packed = d_temp_seed + CTILDEBYTES;
+  uint8_t *d_temp_hint = d_temp_z_packed + DILITHIUM_L * POLYZ_PACKEDBYTES;
+
+  uint8_t *d_temp_mu = d_temp_sig + ALIGN_TO_256_BYTES(CRYPTO_BYTES);
+  uint8_t *d_temp_w1_packed = d_temp_mu + CRHBYTES;
+
+  byte_size =
+      ALIGN_TO_256_BYTES(CRYPTO_BYTES) + // sig
+      ALIGN_TO_256_BYTES(
+          CRHBYTES + DILITHIUM_K * POLYW1_PACKEDBYTES); // d_mu || d_w1_packed
+
+  auto *d_temp_y = (int32_t *)(d_temp_mem_pool + byte_size);
+  int32_t *d_temp_z = d_temp_y + DILITHIUM_L * DILITHIUM_N;
+  int32_t *d_temp_w0 = d_temp_z + DILITHIUM_L * DILITHIUM_N;
+  int32_t *d_temp_w1 = d_temp_w0 + DILITHIUM_K * DILITHIUM_N;
+  int32_t *d_temp_cp = d_temp_w1 + DILITHIUM_K * DILITHIUM_N;
+
+  //    CUDATimer timer_cp("compute_cp");
+  //    CUDATimer timer_w("compute_w");
+  //        CUDATimer timer_y("compute_y");
+  //    CUDATimer timer_rej_loop("timer_rej_loop");
+
+  for (auto &i : lut.sign_lut) {
+    i.done_flag = 0;
+    i.nonce = 0;
+  }
+
+rej:
+
+  // repeatedly use sign_lut to fill exec_lut
+  size_t exec_idx = 0;
+  for (size_t sign_idx = 0; sign_idx < batch_size; sign_idx++) {
+    if (lut.sign_lut[sign_idx].done_flag == 0) {
+      lut.h_exec_lut[exec_idx++] =
+          (sign_idx << 16) | (lut.sign_lut[sign_idx].nonce++);
+      if (exec_idx == exec_threshold) {
+        // exec_lut is full
+        break;
+      }
+    }
+  }
+
+  if (exec_idx == exec_threshold) {
+    // exec_lut is full
+    cudaMemcpyAsync(lut.d_exec_lut, lut.h_exec_lut,
+                    sizeof(uint32_t) * exec_threshold, cudaMemcpyHostToDevice,
+                    stream);
+
+    cudaMemsetAsync(lut.d_done_lut, 0, sizeof(uint8_t) * exec_threshold,
+                    stream);
+
+    //        timer_y.start();
+    //        compute_y_kernel<<<exec_threshold, 32, 0, stream>>>(
+    compute_y_opt_kernel<<<(exec_threshold * DILITHIUM_L + 3) / 4, dim3(32, 4),
+                           0, stream>>>(d_y, d_rhoprime, lut.d_exec_lut,
+                                        d_sign_mem_pool_pitch,
+                                        d_sign_mem_pool_pitch, exec_threshold);
+
+#ifdef USE_128T_SIGN
+    compute_w_128t_kernel<<<exec_threshold, 128, 0, stream>>>(
+        d_w0, d_w1, d_w1_packed, d_y, d_mat, lut.d_exec_lut,
+        d_sign_mem_pool_pitch, d_sign_mem_pool_pitch);
+#else
+    compute_w_32t_kernel<<<exec_threshold, 32, 0, stream>>>(
+        d_z, d_w0, d_w1, d_w1_packed, d_y, d_mat, lut.d_exec_lut,
+        d_sign_mem_pool_pitch, d_sign_mem_pool_pitch);
+#endif
+    //        CUDATimer timer_cp("compute_cp");
+    //        timer_cp.start();
+#ifdef USE_CP_NTT
+    compute_cp_ntt_kernel<<<(exec_threshold + 3) / 4, dim3(32, 4), 0, stream>>>(
+        d_cp, d_mu, d_seed, d_mu, lut.d_exec_lut, d_sign_mem_pool_pitch,
+        d_sign_mem_pool_pitch, exec_threshold);
+#else
+    compute_cp_kernel<<<exec_threshold, 32, 0, stream>>>(
+        d_cp, d_mu, d_seed, d_mu, lut.d_exec_lut, d_sign_mem_pool_pitch,
+        d_sign_mem_pool_pitch);
+    //        cudaStreamSynchronize(stream);
+    //        timer_cp.stop();
+#endif
+
+    //        compute_cp_opt_kernel<<<(exec_threshold + 3) / 4, dim3(32, 4), 0,
+    //        stream>>>(
+    //                d_cp, d_mu,
+    //                d_seed,
+    //                d_mu,
+    //                lut.d_exec_lut, d_sign_mem_pool_pitch,
+    //                d_sign_mem_pool_pitch, exec_threshold);
+
+#ifdef USE_128T_SIGN
+    //        CUDATimer timer_rej("rej");
+    //        timer_rej.start();
+    rej_loop_128t_kernel<<<exec_threshold, 128, 0, stream>>>(
+        d_y, d_z, d_w0, d_w1, d_cp, d_z_packed, d_hint, lut.d_done_lut, d_s1,
+        d_s2, d_t0, lut.d_exec_lut, d_sign_mem_pool_pitch,
+        d_sign_mem_pool_pitch);
+#else
+    rej_loop_32t_kernel<<<exec_threshold, 32, 0, stream>>>(
+        d_y, d_z, d_w0, d_w1, d_cp, d_z_packed, d_hint, lut.d_done_lut, d_s1,
+        d_s2, d_t0, lut.d_exec_lut, d_sign_mem_pool_pitch,
+        d_sign_mem_pool_pitch);
+#endif
+
+    cudaMemcpyAsync(lut.h_done_lut, lut.d_done_lut,
+                    sizeof(uint8_t) * exec_threshold, cudaMemcpyDeviceToHost,
+                    stream);
+
+    cudaStreamSynchronize(stream);
+
+    // update sign_lut
+    for (size_t i = 0; i < exec_threshold; i++) {
+      if (lut.h_done_lut[i]) {
+        // copy result to sign_lut
+        size_t sign_idx = lut.h_exec_lut[i] >> 16;
+        lut.sign_lut[sign_idx].done_flag = 1;
+      }
+    }
+  } else {
+    // exec_lut is not full, need to predict nonce to fulfill it
+    do {
+      for (size_t sign_idx = 0; sign_idx < batch_size; sign_idx++) {
+        if (lut.sign_lut[sign_idx].done_flag == 0) {
+          lut.h_exec_lut[exec_idx++] =
+              (sign_idx << 16) | (lut.sign_lut[sign_idx].nonce++);
+          if (exec_idx == exec_threshold) {
+            // exec_lut is full
+            break;
+          }
+        }
+      }
+    } while (exec_idx < exec_threshold);
+
+    cudaMemset2DAsync(d_temp_hint, d_temp_mem_pool_pitch, 0,
+                      POLYVECH_PACKEDBYTES, exec_threshold, stream);
+
+    cudaMemcpyAsync(lut.d_exec_lut, lut.h_exec_lut,
+                    sizeof(uint32_t) * exec_threshold, cudaMemcpyHostToDevice,
+                    stream);
+
+    cudaMemsetAsync(lut.d_done_lut, 0, sizeof(uint8_t) * exec_threshold,
+                    stream);
+
+    compute_y_opt_kernel<<<(exec_threshold * DILITHIUM_L + 3) / 4, dim3(32, 4),
+                           0, stream>>>(d_temp_y, d_rhoprime, lut.d_exec_lut,
+                                        d_sign_mem_pool_pitch,
+                                        d_temp_mem_pool_pitch, exec_threshold);
+
+#ifdef USE_128T_SIGN
+    compute_w_128t_kernel<<<exec_threshold, 128, 0, stream>>>(
+        d_temp_w0, d_temp_w1, d_temp_w1_packed, d_temp_y, d_mat, lut.d_exec_lut,
+        d_sign_mem_pool_pitch, d_temp_mem_pool_pitch);
+#else
+    compute_w_32t_kernel<<<exec_threshold, 32, 0, stream>>>(
+        d_temp_z, d_temp_w0, d_temp_w1, d_temp_w1_packed, d_temp_y, d_mat,
+        lut.d_exec_lut, d_sign_mem_pool_pitch, d_temp_mem_pool_pitch);
+#endif
+
+#ifdef USE_CP_NTT
+    compute_cp_ntt_kernel<<<(exec_threshold + 3) / 4, dim3(32, 4), 0, stream>>>(
+        d_temp_cp, d_temp_mu, d_temp_seed, d_mu, lut.d_exec_lut,
+        d_sign_mem_pool_pitch, d_temp_mem_pool_pitch, exec_threshold);
+#else
+    compute_cp_kernel<<<exec_threshold, 32, 0, stream>>>(
+        d_temp_cp, d_temp_mu, d_temp_seed, d_mu, lut.d_exec_lut,
+        d_sign_mem_pool_pitch, d_temp_mem_pool_pitch);
+#endif
+
+#ifdef USE_128T_SIGN
+    rej_loop_128t_kernel<<<exec_threshold, 128, 0, stream>>>(
+        d_temp_y, d_temp_z, d_temp_w0, d_temp_w1, d_temp_cp, d_temp_z_packed,
+        d_temp_hint, lut.d_done_lut, d_s1, d_s2, d_t0, lut.d_exec_lut,
+        d_sign_mem_pool_pitch, d_temp_mem_pool_pitch);
+#else
+    rej_loop_32t_kernel<<<exec_threshold, 32, 0, stream>>>(
+        d_temp_y, d_temp_z, d_temp_w0, d_temp_w1, d_temp_cp, d_temp_z_packed,
+        d_temp_hint, lut.d_done_lut, d_s1, d_s2, d_t0, lut.d_exec_lut,
+        d_sign_mem_pool_pitch, d_temp_mem_pool_pitch);
+#endif
+
+    cudaMemcpyAsync(lut.h_done_lut, lut.d_done_lut,
+                    sizeof(uint8_t) * exec_threshold, cudaMemcpyDeviceToHost,
+                    stream);
+
+    cudaStreamSynchronize(stream);
+
+    // copy done signatures to output buffer
+    size_t copy_count = 0;
+    for (exec_idx = 0; exec_idx < exec_threshold; exec_idx++) {
+      if (lut.h_done_lut[exec_idx]) {
+        // check if this signature has a smaller correct nonce this round
+        size_t sign_idx = lut.h_exec_lut[exec_idx] >> 16;
+        if (copy_count == 0) {
+          // copy this signature
+          lut.h_copy_lut[copy_count].exec_idx = exec_idx;
+          lut.h_copy_lut[copy_count++].sign_idx = sign_idx;
+          continue;
+        } else {
+          size_t loop = copy_count;
+          for (size_t i = 0; i < loop; i++) {
+            if (lut.h_copy_lut[i].sign_idx == sign_idx) {
+              break;
+            }
+            if (i == loop - 1) {
+              // copy this signature
+              lut.h_copy_lut[copy_count].exec_idx = exec_idx;
+              lut.h_copy_lut[copy_count++].sign_idx = sign_idx;
+            }
+          }
+        }
+      }
+    }
+
+    if (copy_count == 0) {
+      // no signature is done this round
+      goto rej;
+    }
+
+    cudaMemcpyAsync(lut.d_copy_lut, lut.h_copy_lut,
+                    sizeof(copy_lut_element) * copy_count,
+                    cudaMemcpyHostToDevice, stream);
+
+    // launch copy kernel
+    sig_copy_kernel<<<copy_count, 96, 0, stream>>>(
+        d_sig, d_sign_mem_pool_pitch, d_temp_sig, d_temp_mem_pool_pitch,
+        lut.d_copy_lut);
+
+    // update sign_lut
+    for (size_t copy_idx = 0; copy_idx < copy_count; copy_idx++) {
+      lut.sign_lut[lut.h_copy_lut[copy_idx].sign_idx].done_flag = 1;
+    }
+  }
+
+  //    cudaStreamSynchronize(stream);
+  //    timer_rej_loop.stop();
+
+  for (auto &e : lut.sign_lut) {
+    if (e.done_flag == 0) {
+      goto rej;
+    }
+  }
+#endif
+
+  cudaMemcpy2DAsync(sig, sig_pitch, d_sig, d_sign_mem_pool_pitch, CRYPTO_BYTES,
+                    batch_size, cudaMemcpyDeviceToHost, stream);
+
+  *siglen = CRYPTO_BYTES;
+
+  //    cudaStreamSynchronize(stream);
+  //    timer_sign.stop();
+
+  return 0;
+}
+
+void crypto_sign_verify(int *ret, const uint8_t *sig, size_t sig_pitch,
+                        size_t siglen, const uint8_t *m, size_t m_pitch,
+                        size_t mlen, const uint8_t *pk,
+                        uint8_t *d_verify_mem_pool,
+                        size_t verify_mem_pool_pitch, size_t batch_size,
+                        cudaStream_t stream) {
+
+  if (siglen != CRYPTO_BYTES) {
+    for (size_t i = 0; i < batch_size; ++i)
+      ret[i] = -1;
+    return;
+  }
+
+  size_t byte_size = VERIFY_POOL_BYTE_SIZE(mlen);
+
+  uint8_t *d_sig = d_verify_mem_pool + 0;
+  uint8_t *d_c = d_sig + 0;
+  uint8_t *d_z_packed = d_c + CTILDEBYTES;
+  uint8_t *d_h_packed = d_z_packed + DILITHIUM_L * POLYZ_PACKEDBYTES;
+
+  uint8_t *d_pk = d_sig + ALIGN_TO_256_BYTES(CRYPTO_BYTES);
+  uint8_t *d_rho = d_pk + 0;
+  uint8_t *d_t1_packed = d_rho + SEEDBYTES;
+
+  // tr || M', M' = 0 || 0 || m (pure ML-DSA, empty context)
+  uint8_t *d_muprime = d_pk + ALIGN_TO_256_BYTES(CRYPTO_PUBLICKEYBYTES);
+  uint8_t *d_msg_prefix = d_muprime + TRBYTES;
+  uint8_t *d_m = d_msg_prefix + MSG_PREFIX_BYTES;
+
+  uint8_t *d_mu =
+      d_muprime + ALIGN_TO_256_BYTES(TRBYTES + MSG_PREFIX_BYTES + mlen);
+  uint8_t *d_w1prime_packed = d_mu + CRHBYTES;
+
+  uint8_t *d_ctilde =
+      d_mu + ALIGN_TO_256_BYTES(CRHBYTES + DILITHIUM_K * POLYW1_PACKEDBYTES);
+
+  auto *d_mat = (int32_t *)(d_verify_mem_pool + byte_size);
+  int32_t *d_z = d_mat + DILITHIUM_K * DILITHIUM_L * DILITHIUM_N;
+  int32_t *d_t1 = d_z + DILITHIUM_L * DILITHIUM_N;
+  int32_t *d_w1prime = d_t1 + DILITHIUM_K * DILITHIUM_N;
+  int32_t *d_h = d_w1prime + DILITHIUM_K * DILITHIUM_N;
+  int32_t *d_cp = d_h + DILITHIUM_K * DILITHIUM_N;
+  int *d_ret = d_cp + DILITHIUM_N;
+
+  cudaMemset2DAsync(d_h, verify_mem_pool_pitch, 0,
+                    DILITHIUM_K * DILITHIUM_N * sizeof(int32_t), batch_size,
+                    stream);
+  cudaMemset2DAsync(d_ret, verify_mem_pool_pitch, -1, sizeof(int), batch_size,
+                    stream);
+  cudaMemset2DAsync(d_msg_prefix, verify_mem_pool_pitch, 0, MSG_PREFIX_BYTES,
+                    batch_size, stream);
+
+  cudaMemcpy2DAsync(d_sig, verify_mem_pool_pitch, sig, sig_pitch, CRYPTO_BYTES,
+                    batch_size, cudaMemcpyHostToDevice, stream);
+  cudaMemcpy2DAsync(d_m, verify_mem_pool_pitch, m, m_pitch, mlen, batch_size,
+                    cudaMemcpyHostToDevice, stream);
+  cudaMemcpy2DAsync(d_pk, verify_mem_pool_pitch, pk, CRYPTO_PUBLICKEYBYTES,
+                    CRYPTO_PUBLICKEYBYTES, batch_size, cudaMemcpyHostToDevice,
+                    stream);
+
+  gpu_verify<<<batch_size, 32, 0, stream>>>(
+      d_ret, d_c, d_z_packed, d_h_packed, d_rho, d_t1_packed, d_muprime, d_m,
+      d_mu, d_w1prime_packed, d_ctilde, d_mat, d_z, d_t1, d_w1prime, d_h, d_cp,
+      mlen, verify_mem_pool_pitch);
+
+  cudaMemcpy2DAsync(ret, sizeof(int), d_ret, verify_mem_pool_pitch, sizeof(int),
+                    batch_size, cudaMemcpyDeviceToHost, stream);
+}
