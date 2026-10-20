@@ -10,7 +10,7 @@ Signing is deterministic (`rnd` = 0, empty context string). In this mode, every 
 
 ## Requirements
 
-- NVIDIA GPU with compute capability 8.0 or higher. We tested the A100 (sm_80), RTX 4050 Laptop (sm_89), H100 (sm_90) and B200 (sm_100).
+- NVIDIA GPU with compute capability 8.0 or higher. We tested the A100 (sm_80), RTX 4050 (sm_89), H100 (sm_90) and B200 (sm_100).
 - CUDA 12.2 or newer; the B200 needs 12.8 or newer.
 - GCC 11 or newer, CMake 3.20 or newer, OpenMP.
 
